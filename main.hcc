@@ -3,9 +3,6 @@
 extern clk_port;
 set clock = internal CLK;
 
-unsigned 12 buffer_start;
-unsigned 12 buffer_size;
-
 #define STATE_HEAD 1
 #define STATE_DATA 2
 
@@ -21,12 +18,20 @@ unsigned 12 buffer_size;
 #define BUFFER_MAX_INDEX 4094
 
 mpram {
-  rom <unsigned 12> readport[BUFFER_MAX_SIZE];
-  wom <unsigned 12> writeport[BUFFER_MAX_SIZE];
+  rom <unsigned 16>  readport[BUFFER_MAX_SIZE];
+  wom <unsigned 16> writeport[BUFFER_MAX_SIZE];
 } buffer with {block=1};
 
-chan <unsigned 12> buffer_read_result, buffer_write;
+chan <unsigned 16> buffer_read_result;
+chan <unsigned 14> buffer_write;
 chan <unsigned 1> buffer_read_flag, buffer_clear_flag;
+
+unsigned 12 buffer_start;
+unsigned 16 last_sample;
+unsigned 12 channel_sizes[4];
+unsigned 3  mix_count;
+
+#define FOREACH_CHANNEL FOR_CHANNEL(0) FOR_CHANNEL(1) FOR_CHANNEL(2) FOR_CHANNEL(3)
 
 
 inline unsigned 32 wait_for_fsl_data() {
@@ -44,9 +49,11 @@ inline unsigned 32 wait_for_fsl_data() {
 
 void read_data_from_fsl() {
   unsigned int 32 fsldatain;
-  unsigned int 16 sample_length, sample_temp;
-  unsigned int 8 read_state, sample_width, sample_rate, 
-                 sample_scale1, sample_scale2, i;
+  unsigned int 31 sample_length;
+  unsigned int 16 sample_temp;
+  unsigned int 8 read_state, sample_width, sample_rate;
+  unsigned int 4 scale1, scale2, i;
+  unsigned int 2 mix_number;
   unsigned int 1 initialise;
   
   
@@ -54,55 +61,67 @@ void read_data_from_fsl() {
   
   while (1) {
 
-    // 11111111     11111111      11111111  11111111
-    // sample rate  sample width  reserved  reserved
+    // sample rate  sample width  mix  mix id  num count  unused
+    // 11111111     11111111      1    11      111        1111111111
     fsldatain = wait_for_fsl_data();
     
     par { sample_rate   = fsldatain[31:24];
-          sample_width  = fsldatain[23:16]; }
+          sample_width  = fsldatain[23:16];
+          mix_number    = fsldatain[14:13];
+          mix_count     = fsldatain[12:10]; }
           
-    // 1      11111111111111111111111111111
     // init   length/4 of packet data
+    // 1      11111111111111111111111111111
     fsldatain = wait_for_fsl_data();
           
-    par { initialise    = fsldatain[31:31];
-          sample_length = fsldatain[15:0]; }
+    par { initialise    = fsldatain[31];
+          sample_length = fsldatain[30:0]; }
           
+    // If switches have been changed then the initialise flag is
+    // set and so we need to clear the current buffer.
     if (initialise) {
-      buffer_clear_flag ! 1; 
-    }
-    
+      buffer_clear_flag ! 1;
+    }    
 
     while (sample_length > 0) {
 
       fsldatain = wait_for_fsl_data();
       
-      sample_scale1 = (sample_rate == SAMPLE_RATE8)  ? 5 :
-                      (sample_rate == SAMPLE_RATE11) ? 4 :
-                      (sample_rate == SAMPLE_RATE22) ? 2 :
-                      (sample_rate == SAMPLE_RATE44) ? 1 : 1;
+      // Samples need to be scaled if they aren't 44k
+      // 8k samples alternate between 5x and 6x to get close enough
+      scale1 = (sample_rate == SAMPLE_RATE8)  ? 5 :
+               (sample_rate == SAMPLE_RATE11) ? 4 :
+               (sample_rate == SAMPLE_RATE22) ? 2 :
+               (sample_rate == SAMPLE_RATE44) ? 1 : 1;
       
-      sample_scale2 = (sample_rate == SAMPLE_RATE8) ? 6 : sample_scale1;
-
-      #define REP1(x)  for(i = 0; i < sample_scale1; i++) { x }
-      #define REP2(x)  for(i = 0; i < sample_scale2; i++) { x }
+      scale2 = (sample_rate == SAMPLE_RATE8)  ? 6 : scale1;
+      
+      #define REP(reps, data) \
+        for(i = 0; i < (reps); i++) { buffer_write ! mix_number @ data; }
       
       if (sample_width == SAMPLE_WIDTH8) {
-        REP1( buffer_write ! fsldatain[31:24] @ 0; )
-        REP2( buffer_write ! fsldatain[23:16] @ 0; )
-        REP1( buffer_write ! fsldatain[15:8]  @ 0; )
-        REP2( buffer_write ! fsldatain[7:0]   @ 0; )
+        
+        // 4 sample in every int
+        
+        REP(scale1, fsldatain[31:24] @ 0);
+        REP(scale2, fsldatain[23:16] @ 0);
+        REP(scale1, fsldatain[15:8]  @ 0);
+        REP(scale2, fsldatain[7:0]   @ 0);
+        
       }
       else if (sample_width == SAMPLE_WIDTH16) {
+        
+        // 2 sample in an int but samples are signed
+        
         sample_temp = ~ fsldatain[31:16] + 1;
-        REP1( buffer_write ! sample_temp[15:4]; )
+        REP(scale1, sample_temp[15:4]);
           
         sample_temp = ~ fsldatain[15:0] + 1;
-        REP2( buffer_write ! sample_temp[15:4]; )
+        REP(scale2, sample_temp[15:4]);
+        
       }
-      
-      #undef REP1
-      #undef REP2
+
+      #undef REP
       
       sample_length --;
 
@@ -112,107 +131,129 @@ void read_data_from_fsl() {
   }
 }
 void send_data_to_dac() {
-  unsigned int 12 receive;
+  unsigned int 16 receive;
   unsigned int 16 time;
   
   while (1) {
     buffer_read_flag ! 1;              // 
     buffer_read_result ? receive;      // ~7 clock cyles
-    dac_write_to_output(0xF, receive); // ~131 clock cycles
+    
+    if      (mix_count >= 3) receive = receive >> 2;
+    else if (mix_count >= 2) receive = receive >> 1;
+      
+    dac_write_to_output(0xF, receive[11:0]); // ~131 clock cycles
             
     // Delay 50,000,000 / rate - above cycles
-    for (time = 0; time < 995; time++); 
+    for (time = 0; time < 999; time++); 
   }
+  
 }
 
-// Read data from the buffer, send through buffer_read. 
-// Assume buffer is not empty (size > 0)
-inline void manage_buffer_read() {
-  unsigned 12 value;
+void manage_buffer_read() {
+  // Read data from the buffer, send through buffer_read. 
+  // Assume buffer is not empty (size > 0)
+  
+  
+  unsigned 16 value;
+  unsigned int  1 all_empty;
+  
+  all_empty = 1;
+  #define FOR_CHANNEL(x) all_empty &= (channel_sizes[0] == 0);
+    FOREACH_CHANNEL
+  #undef FOR_CHANNEL
+
+  if (all_empty) {
+    buffer_read_result ! last_sample;
+    return;
+  }
+  
   value = buffer.readport[buffer_start];
-  par { buffer_read_result ! value;
-        buffer_start ++; // Overflow should wrap
-        buffer_size  --; }
+ 
+  buffer.writeport[buffer_start] = 0;
+  
+  par { 
+    buffer_read_result ! value;
+    last_sample = value;
+    buffer_start ++; // Overflow should wrap
+    
+    #define FOR_CHANNEL(x) \
+      if (channel_sizes[x] != 0) channel_sizes[x] --;
+      FOREACH_CHANNEL
+    #undef FOR_CHANNEL
+    
+  }
+  
 }
 
 
-// Write data to the buffer, assume buffer is not full
-inline void manage_buffer_write(unsigned int 12 data) {
-  unsigned 12 buffer_write_id;
-  buffer_write_id = buffer_start + buffer_size;
-  par { buffer.writeport[buffer_write_id] = data;
-        buffer_size ++; }
+void manage_buffer_write(unsigned int 14 mix_data) {
+  // Write data to the buffer, assume buffer is not full
+  
+  unsigned 2 mix_number;
+  unsigned 12 write_id;
+  unsigned 16 data;
+  
+  mix_number = mix_data[13:12];
+  if (channel_sizes[mix_number] == BUFFER_MAX_INDEX)
+    return;
+  
+  write_id = buffer_start + channel_sizes[mix_number];
+  data = buffer.readport[write_id];
+  data = data + (0 @ mix_data[11:0]);
+  
+  par { buffer.writeport[write_id] = data;
+        channel_sizes[mix_number] ++; }
+        
 }
 
-inline void manage_buffer_clear() {
+void manage_buffer_clear() {
   unsigned 12 i;
-  par { buffer_start = 0;
-        buffer_size = 0; }
-  //for(i = 0; i <= BUFFER_MAX_INDEX; i++) {
-  //  buffer.writeport[i] = 0;
-  //}
+  
+  par { 
+    buffer_start = 0;
+  
+    // Reset all channel sizes to zero
+    #define FOR_CHANNEL(x) channel_sizes[x] = 0;
+      FOREACH_CHANNEL
+    #undef FOR_CHANNEL
+
+    for(i = 0; i <= BUFFER_MAX_INDEX; i++) {
+      buffer.writeport[i] = 0;
+    }
+  }
+  
 }
 
 void manage_buffer() {
-  unsigned int 12 receive;
-  unsigned int 1 receive_1;
+  unsigned int 14 receive;
+  unsigned int  1 receive_1;
+  unsigned int  1 all_empty;
   
   while(1) {
     
-    #define PRIALT_CLEAR \
-      case buffer_clear_flag ? receive_1: \
-          manage_buffer_clear(); \
-          break;
-    #define PRIALT_WRITE \
-        case buffer_write ? receive: \
-          manage_buffer_write(receive); \
-          break;
-    #define PRIALT_NOWRITE \
-        case buffer_write ? receive: \
-          delay; \
-          break;
-    #define PRIALT_READ \
-        case buffer_read_flag ? receive_1:\
-          manage_buffer_read();\
-          break;
-    #define PRIALT_DEFAULT \
-        default:\
-          delay;\
-          break;
+    prialt {
+      case buffer_clear_flag ? receive_1:
+        manage_buffer_clear();
+        break;
     
-    // Buffer is empty
-    if (buffer_size == 0) {
-      prialt { PRIALT_CLEAR; 
-               PRIALT_WRITE; 
-               PRIALT_DEFAULT; }
-    }
-    // Buffer is full
-    else if (buffer_size == BUFFER_MAX_INDEX) {
-      prialt { PRIALT_CLEAR; 
-               PRIALT_READ; 
-               PRIALT_NOWRITE; 
-               PRIALT_DEFAULT; }
-    }  
-    // Buffer is neither empty or full
-    else {
-      prialt { PRIALT_CLEAR; 
-               PRIALT_READ; 
-               PRIALT_WRITE; 
-               PRIALT_DEFAULT; }
+      case buffer_write ? receive:
+        manage_buffer_write(receive);
+        break;
+      
+      case buffer_read_flag ? receive_1:
+        manage_buffer_read();
+        break;
     }
     
-    #undef PRIALT_CLEAR
-    #undef PRIALT_READ
-    #undef PRIALT_WRITE
-    #undef PRIALT_DEFAULT
   }
 }
 
 void main(void) {
-  buffer_start = 0;
-  buffer_size = 0;
-  
   initialise();
+  
+  last_sample = 0;
+  manage_buffer_clear();
+  
   par {
     uart_driver();
 
